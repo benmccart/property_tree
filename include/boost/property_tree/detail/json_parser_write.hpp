@@ -10,12 +10,15 @@
 #ifndef BOOST_PROPERTY_TREE_DETAIL_JSON_PARSER_WRITE_HPP_INCLUDED
 #define BOOST_PROPERTY_TREE_DETAIL_JSON_PARSER_WRITE_HPP_INCLUDED
 
+#include <boost/cstdint.hpp>
 #include <boost/property_tree/ptree.hpp>
 #include <boost/next_prior.hpp>
 #include <boost/type_traits/make_unsigned.hpp>
 #include <string>
+#include <sstream>
 #include <ostream>
 #include <iomanip>
+#include <codecvt>
 
 namespace boost { namespace property_tree { namespace json_parser
 {
@@ -33,30 +36,73 @@ namespace boost { namespace property_tree { namespace json_parser
             // We escape everything outside ASCII, because this code can't
             // handle high unicode characters.
             if (*b == 0x20 || *b == 0x21 || (*b >= 0x23 && *b <= 0x2E) ||
-                (*b >= 0x30 && *b <= 0x5B) || (*b >= 0x5D && *b <= 0xFF))
+                (*b >= 0x30 && *b <= 0x5B) || (*b >= 0x5D && *b < 0x80))
                 result += *b;
             else if (*b == Ch('\b')) result += Ch('\\'), result += Ch('b');
             else if (*b == Ch('\f')) result += Ch('\\'), result += Ch('f');
+            else if (*b == Ch('\t')) result += Ch('\\'), result += Ch('t');
             else if (*b == Ch('\n')) result += Ch('\\'), result += Ch('n');
             else if (*b == Ch('\r')) result += Ch('\\'), result += Ch('r');
-            else if (*b == Ch('\t')) result += Ch('\\'), result += Ch('t');
             else if (*b == Ch('/')) result += Ch('\\'), result += Ch('/');
             else if (*b == Ch('"'))  result += Ch('\\'), result += Ch('"');
             else if (*b == Ch('\\')) result += Ch('\\'), result += Ch('\\');
             else
             {
-                const char *hexdigits = "0123456789ABCDEF";
+                std::ostringstream oss;
                 typedef typename make_unsigned<Ch>::type UCh;
-                unsigned long u = (std::min)(static_cast<unsigned long>(
-                                                 static_cast<UCh>(*b)),
-                                             0xFFFFul);
-                int d1 = u / 4096; u -= d1 * 4096;
-                int d2 = u / 256; u -= d2 * 256;
-                int d3 = u / 16; u -= d3 * 16;
-                int d4 = u;
-                result += Ch('\\'); result += Ch('u');
-                result += Ch(hexdigits[d1]); result += Ch(hexdigits[d2]);
-                result += Ch(hexdigits[d3]); result += Ch(hexdigits[d4]);
+                if (long((std::numeric_limits<UCh>::max)()) >= 0xFFFF)
+                {
+                    // Assume UTF16.
+                    oss << "\\u" << std::setw(4) << std::setfill('0') << std::hex << std::uppercase << uint16_t(*b);
+                    if ((0xD7FF < uint16_t(*b)) && (uint16_t(*b) < 0xE000))
+                    {
+                        // Add second 16 bit value for surrogat6e pair
+                        if (e-b == 1)
+                            BOOST_PROPERTY_TREE_THROW(json_parser_error("write error", "", 0));
+
+                        ++b;
+                        oss << "\\u" << std::setw(4) << std::setfill('0') << std::hex << std::uppercase << uint16_t(*b);
+                    }
+
+                    result += oss.str();
+                }
+                else
+                {
+                    // Assume UTF8
+                    std::mbstate_t state = 0;
+                    std::codecvt_utf8_utf16<wchar_t> utf16_utf8;
+
+                    std::size_t len = std::size_t(e - b);
+                    std::size_t in_max = (std::min)(len, std::size_t(4));
+
+                    // Determine how many 'C' chars will be consumed to constuct a single UTF8 codepoint - this is
+                    // required as codecvt.in will fail if it begins another code point that can't be completed
+                    // because the 'end' of input sequence is reached...
+                    if ((*b & uint8_t(0xE0)) == uint8_t(0xC0))
+                        in_max = (std::min)(len, std::size_t(2));
+                    else if ((*b & uint8_t(0xF0)) == uint8_t(0xE0))
+                        in_max = (std::min)(len, std::size_t(3));
+                    else if ((*b & uint8_t(0xF8)) == uint8_t(0xF0))
+                        in_max = (std::min)(len, std::size_t(4));
+                    else
+                        BOOST_PROPERTY_TREE_THROW(json_parser_error("write error", "", 0));
+
+                    Ch const *from_next = &*b;
+                    wchar_t utf16str[2] = { wchar_t(0), wchar_t(0) };
+                    wchar_t *to_next = utf16str;
+                    if (utf16_utf8.in(state, &*b, (&*b) + in_max, from_next, utf16str, utf16str + 2, to_next) != 0)
+                        BOOST_PROPERTY_TREE_THROW(json_parser_error("write error", "", 0));
+
+                    oss << "\\u" << std::setw(4) << std::setfill('0') << std::hex << std::uppercase << uint16_t(utf16str[0]);
+                    if ( to_next - utf16str == 2)
+                    {
+                        // Add second 16 bit value for surrogat6e pair
+                        oss << "\\u" << std::setw(4) << std::setfill('0') << std::hex << std::uppercase << uint16_t(utf16str[1]);
+                    }
+                    result += oss.str();
+
+                    b += ((from_next - &*b) - std::size_t(1)); // Additinal incrementing for additional UTF8 chars consumed.
+                }
             }
             ++b;
         }
@@ -65,8 +111,8 @@ namespace boost { namespace property_tree { namespace json_parser
 
     template<class Ptree>
     void write_json_helper(std::basic_ostream<typename Ptree::key_type::value_type> &stream, 
-                           const Ptree &pt,
-                           int indent, bool pretty)
+        const Ptree &pt,
+        int indent, bool pretty)
     {
 
         typedef typename Ptree::key_type::value_type Ch;
@@ -75,10 +121,40 @@ namespace boost { namespace property_tree { namespace json_parser
         // Value or object or array
         if (indent > 0 && pt.empty())
         {
+            static Ch const str_true[] =  {Ch('t'), Ch('r'), Ch('u'), Ch('e'), Ch('\0')};
+            static Ch const str_false[] = {Ch('f'), Ch('a'), Ch('l'), Ch('s'), Ch('e'), Ch('\0')};
+            static Ch const str_null[] =  {Ch('n'), Ch('u'), Ch('l'), Ch('l'), Ch('\0')};
+
             // Write value
             Str data = create_escapes(pt.template get_value<Str>());
-            stream << Ch('"') << data << Ch('"');
-
+            bool written = false;
+            if (data == str_true || data == str_false || data == str_null)
+            {
+                stream << data;
+                written = true;
+            }
+            if (!written)
+            {
+                auto val = pt.template get_value_optional<int>();
+                if (val)
+                {
+                    stream << *val;
+                    written = true;
+                }
+            }
+            if (!written)
+            {
+                auto val = pt.template get_value_optional<double>();
+                if (val)
+                {
+                    stream << *val;
+                    written = true;
+                }
+            }
+            if (!written)
+            {
+                stream << Ch('"') << data << Ch('"');
+            }
         }
         else if (indent > 0 && pt.count(Str()) == pt.size())
         {
@@ -94,9 +170,7 @@ namespace boost { namespace property_tree { namespace json_parser
                     stream << Ch(',');
                 if (pretty) stream << Ch('\n');
             }
-            if (pretty) stream << Str(4 * indent, Ch(' '));
-            stream << Ch(']');
-
+            stream << Str(4 * indent, Ch(' ')) << Ch(']');
         }
         else
         {
@@ -108,7 +182,12 @@ namespace boost { namespace property_tree { namespace json_parser
             {
                 if (pretty) stream << Str(4 * (indent + 1), Ch(' '));
                 stream << Ch('"') << create_escapes(it->first) << Ch('"') << Ch(':');
-                if (pretty) stream << Ch(' ');
+                if (pretty) {
+                    if (it->second.empty())
+                        stream << Ch(' ');
+                    else
+                        stream << Ch('\n') << Str(4 * (indent + 1), Ch(' '));
+                }
                 write_json_helper(stream, it->second, indent + 1, pretty);
                 if (boost::next(it) != pt.end())
                     stream << Ch(',');
@@ -131,7 +210,7 @@ namespace boost { namespace property_tree { namespace json_parser
         // Root ptree cannot have data
         if (depth == 0 && !pt.template get_value<Str>().empty())
             return false;
-        
+
         // Ptree cannot have both children and data
         if (!pt.template get_value<Str>().empty() && !pt.empty())
             return false;
@@ -146,18 +225,21 @@ namespace boost { namespace property_tree { namespace json_parser
         return true;
 
     }
-    
+
     // Write ptree to json stream
     template<class Ptree>
     void write_json_internal(std::basic_ostream<typename Ptree::key_type::value_type> &stream, 
-                             const Ptree &pt,
-                             const std::string &filename,
-                             bool pretty)
+        const Ptree &pt,
+        const std::string &filename,
+        bool pretty)
     {
         if (!verify_json(pt, 0))
             BOOST_PROPERTY_TREE_THROW(json_parser_error("ptree contains data that cannot be represented in JSON format", filename, 0));
+
+        stream.setf(std::ios::fixed, std::ios::floatfield); 
+        stream.precision(std::numeric_limits<double>::digits10 + 1); 
+
         write_json_helper(stream, pt, 0, pretty);
-        stream << std::endl;
         if (!stream.good())
             BOOST_PROPERTY_TREE_THROW(json_parser_error("write error", filename, 0));
     }
